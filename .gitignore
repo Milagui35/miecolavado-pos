@@ -1,0 +1,6 @@
+.env
+node_modules
+sales_history.json
+users.json
+config.json
+cash_closures.json
