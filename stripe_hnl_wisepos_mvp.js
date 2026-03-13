@@ -18,6 +18,7 @@ const SESSION_SECRET = process.env.SESSION_SECRET || 'miecolavado-pos-session';
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const SALES_FILE = path.join(__dirname, 'sales_history.json');
 const USERS_FILE = path.join(__dirname, 'users.json');
+const CASH_CLOSURES_FILE = path.join(__dirname, 'cash_closures.json');
 
 function roundToCents(amount) {
   return Math.round(Number(amount || 0) * 100) / 100;
@@ -28,6 +29,51 @@ function toMinorUnits(amountDecimal, currency) {
     throw new Error(`Unsupported currency for this POS: ${currency}`);
   }
   return Math.round(Number(amountDecimal || 0) * 100);
+}
+
+function readJson(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function writeJson(filePath, data) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+function ensureSalesFile() {
+  if (!fs.existsSync(SALES_FILE)) {
+    fs.writeFileSync(SALES_FILE, JSON.stringify({ sales: [] }, null, 2));
+  }
+}
+
+function ensureUsersFile() {
+  if (!fs.existsSync(USERS_FILE)) {
+    fs.writeFileSync(
+      USERS_FILE,
+      JSON.stringify(
+        {
+          users: [
+            {
+              username: 'admin',
+              password: '5858',
+              role: 'admin',
+              createdAtISO: new Date().toISOString(),
+            },
+          ],
+        },
+        null,
+        2
+      )
+    );
+  }
+}
+
+function ensureCashClosuresFile() {
+  if (!fs.existsSync(CASH_CLOSURES_FILE)) {
+    fs.writeFileSync(
+      CASH_CLOSURES_FILE,
+      JSON.stringify({ closures: [] }, null, 2)
+    );
+  }
 }
 
 function ensureConfigFile() {
@@ -45,51 +91,54 @@ function ensureConfigFile() {
         2
       )
     );
+    return;
   }
-}
 
-function ensureSalesFile() {
-  if (!fs.existsSync(SALES_FILE)) {
-    fs.writeFileSync(
-      SALES_FILE,
-      JSON.stringify({ sales: [] }, null, 2)
-    );
-  }
-}
+  const config = readJson(CONFIG_FILE);
 
-function ensureUsersFile() {
-  if (!fs.existsSync(USERS_FILE)) {
-    fs.writeFileSync(
-      USERS_FILE,
-      JSON.stringify(
-        {
-          users: [
-            {
-              username: 'admin',
-              password: '5858',
-              role: 'admin',
-            },
-          ],
-        },
-        null,
-        2
-      )
-    );
+  if (!Number.isFinite(Number(config.usd_per_hnl)) || Number(config.usd_per_hnl) <= 0) {
+    config.usd_per_hnl = Number(process.env.USD_PER_HNL || 0.04065);
   }
+
+  if (!Number.isFinite(Number(config.tax_rate)) || Number(config.tax_rate) < 0) {
+    config.tax_rate = 0.15;
+  }
+
+  if (!Number.isFinite(Number(config.receipt_counter)) || Number(config.receipt_counter) < 1) {
+    config.receipt_counter = 1;
+  }
+
+  if (
+    !config.current_shift_start ||
+    Number.isNaN(new Date(config.current_shift_start).getTime())
+  ) {
+    let fallbackShiftStart = new Date().toISOString();
+
+    if (fs.existsSync(SALES_FILE)) {
+      const sales = (readJson(SALES_FILE).sales || [])
+        .filter((sale) => sale && sale.createdAtISO)
+        .sort(
+          (a, b) =>
+            new Date(a.createdAtISO).getTime() -
+            new Date(b.createdAtISO).getTime()
+        );
+
+      if (sales.length > 0) {
+        fallbackShiftStart = sales[0].createdAtISO;
+      }
+    }
+
+    config.current_shift_start = fallbackShiftStart;
+  }
+
+  writeJson(CONFIG_FILE, config);
 }
 
 function ensureDataFiles() {
-  ensureConfigFile();
   ensureSalesFile();
   ensureUsersFile();
-}
-
-function readJson(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-}
-
-function writeJson(filePath, data) {
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  ensureCashClosuresFile();
+  ensureConfigFile();
 }
 
 function getConfig() {
@@ -115,6 +164,25 @@ function getUsersData() {
   return readJson(USERS_FILE);
 }
 
+function saveUsersData(data) {
+  writeJson(USERS_FILE, data);
+}
+
+function getCashClosuresData() {
+  ensureCashClosuresFile();
+  return readJson(CASH_CLOSURES_FILE);
+}
+
+function saveCashClosuresData(data) {
+  writeJson(CASH_CLOSURES_FILE, data);
+}
+
+function saveCashClosureRecord(record) {
+  const data = getCashClosuresData();
+  data.closures.unshift(record);
+  saveCashClosuresData(data);
+}
+
 function saveSaleRecord(record) {
   const salesData = getSalesData();
   salesData.sales.unshift(record);
@@ -133,6 +201,7 @@ function calculateTotals(hnlAmount, taxRate) {
   const subtotalHnl = roundToCents(hnlAmount);
   const taxAmountHnl = roundToCents(subtotalHnl * Number(taxRate || 0));
   const totalHnl = roundToCents(subtotalHnl + taxAmountHnl);
+
   return {
     subtotalHnl,
     taxAmountHnl,
@@ -146,6 +215,7 @@ function convertHnlToUsd(hnlAmount, usdPerHnl) {
 
 function buildCart({ description, hnlAmount, taxRate }) {
   const totals = calculateTotals(hnlAmount, taxRate);
+
   return {
     currency: 'hnl',
     tax: toMinorUnits(totals.taxAmountHnl, 'hnl'),
@@ -199,10 +269,14 @@ async function createPaymentIntent({
     capture_method: 'automatic',
     description:
       description +
-      ' | Receipt #' + receiptNumber +
-      ' | Subtotal HNL: L ' + totals.subtotalHnl.toFixed(2) +
-      ' | ISV: L ' + totals.taxAmountHnl.toFixed(2) +
-      ' | Total HNL: L ' + totals.totalHnl.toFixed(2),
+      ' | Receipt #' +
+      receiptNumber +
+      ' | Subtotal HNL: L ' +
+      totals.subtotalHnl.toFixed(2) +
+      ' | ISV: L ' +
+      totals.taxAmountHnl.toFixed(2) +
+      ' | Total HNL: L ' +
+      totals.totalHnl.toFixed(2),
     metadata: {
       receipt_number: receiptNumber,
       source_currency: 'hnl',
@@ -253,11 +327,9 @@ async function getFinalPaymentIntentWithRetry(paymentIntentId) {
     if (
       latest &&
       latest.status &&
-      ![
-        'requires_payment_method',
-        'requires_confirmation',
-        'processing',
-      ].includes(latest.status)
+      !['requires_payment_method', 'requires_confirmation', 'processing'].includes(
+        latest.status
+      )
     ) {
       return latest;
     }
@@ -280,6 +352,7 @@ async function getFinalPaymentIntentWithRetry(paymentIntentId) {
 function parseCookies(cookieHeader) {
   const cookies = {};
   if (!cookieHeader) return cookies;
+
   cookieHeader.split(';').forEach((item) => {
     const parts = item.split('=');
     const key = (parts.shift() || '').trim();
@@ -288,6 +361,7 @@ function parseCookies(cookieHeader) {
       cookies[key] = decodeURIComponent(value);
     }
   });
+
   return cookies;
 }
 
@@ -302,13 +376,16 @@ function getCurrentUser(req) {
   const cookies = parseCookies(req.headers.cookie || '');
   const username = cookies.pos_user || '';
   const token = cookies.pos_token || '';
+
   if (!username || !token) return null;
 
   const users = getUsersData().users || [];
   const user = users.find((entry) => entry.username === username);
+
   if (!user) return null;
 
   const expectedToken = buildSessionToken(user.username, user.password);
+
   if (expectedToken !== token) return null;
 
   return {
@@ -319,21 +396,25 @@ function getCurrentUser(req) {
 
 function requireAuth(req, res, next) {
   const user = getCurrentUser(req);
+
   if (!user) {
     if ((req.path || '').startsWith('/api/')) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     return res.redirect('/login');
   }
+
   req.currentUser = user;
   next();
 }
 
 function requireAdmin(req, res, next) {
   const user = req.currentUser || getCurrentUser(req);
+
   if (!user || user.role !== 'admin') {
     return res.status(403).json({ error: 'Admin only' });
   }
+
   next();
 }
 
@@ -378,10 +459,40 @@ function normalizeAttemptStatus(paymentIntent, fallbackError) {
   return 'failed';
 }
 
-function calculateShiftSummary() {
+function getSafeShiftStartISO() {
   const config = getConfig();
+  const shiftStart = config.current_shift_start;
+
+  if (shiftStart && !Number.isNaN(new Date(shiftStart).getTime())) {
+    return shiftStart;
+  }
+
+  const sales = (getSalesData().sales || []).filter((sale) => sale.createdAtISO);
+
+  if (sales.length > 0) {
+    const oldestSaleISO = sales
+      .slice()
+      .sort(
+        (a, b) =>
+          new Date(a.createdAtISO).getTime() - new Date(b.createdAtISO).getTime()
+      )[0].createdAtISO;
+
+    config.current_shift_start = oldestSaleISO || new Date().toISOString();
+  } else {
+    config.current_shift_start = new Date().toISOString();
+  }
+
+  saveConfig(config);
+  return config.current_shift_start;
+}
+
+function calculateShiftSummary() {
+  const shiftStartISO = getSafeShiftStartISO();
+  const shiftStartMs = new Date(shiftStartISO).getTime();
+
   const sales = (getSalesData().sales || []).filter((sale) => {
-    return new Date(sale.createdAtISO).getTime() >= new Date(config.current_shift_start).getTime();
+    const saleMs = new Date(sale.createdAtISO).getTime();
+    return !Number.isNaN(saleMs) && saleMs >= shiftStartMs;
   });
 
   let totalSoldHnl = 0;
@@ -404,8 +515,8 @@ function calculateShiftSummary() {
   });
 
   return {
-    shiftStartISO: config.current_shift_start,
-    shiftStartLocal: new Date(config.current_shift_start).toLocaleString('es-HN'),
+    shiftStartISO,
+    shiftStartLocal: new Date(shiftStartISO).toLocaleString('es-HN'),
     attempts: sales.length,
     successCount,
     failedCount,
@@ -414,6 +525,51 @@ function calculateShiftSummary() {
     totalUsd: roundToCents(totalUsd),
     totalTaxHnl: roundToCents(totalTaxHnl),
   };
+}
+
+function updateSaleStatusByReceiptNumber({
+  receiptNumber,
+  newStatus,
+  errorMessage,
+  changedBy,
+}) {
+  const salesData = getSalesData();
+  const index = (salesData.sales || []).findIndex(
+    (sale) => String(sale.receiptNumber || '') === String(receiptNumber || '')
+  );
+
+  if (index === -1) {
+    throw new Error('Receipt not found');
+  }
+
+  const allowedStatuses = [
+    'succeeded',
+    'failed',
+    'requires_payment_method',
+    'processing',
+    'canceled',
+  ];
+
+  if (!allowedStatuses.includes(newStatus)) {
+    throw new Error('Invalid status');
+  }
+
+  const sale = salesData.sales[index];
+  sale.paymentIntentStatus = newStatus;
+  sale.errorMessage = String(errorMessage || '').trim();
+  sale.manuallyAdjusted = true;
+  sale.manuallyAdjustedAtISO = new Date().toISOString();
+  sale.manuallyAdjustedAtLocal = new Date().toLocaleString('es-HN');
+  sale.manuallyAdjustedBy = changedBy || 'admin';
+
+  if (newStatus === 'succeeded' && !sale.errorMessage) {
+    sale.errorMessage = '';
+  }
+
+  salesData.sales[index] = sale;
+  saveSalesData(salesData);
+
+  return sale;
 }
 
 ensureDataFiles();
@@ -514,7 +670,9 @@ app.post('/login', (req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '').trim();
   const users = getUsersData().users || [];
-  const user = users.find((entry) => entry.username === username && entry.password === password);
+  const user = users.find(
+    (entry) => entry.username === username && entry.password === password
+  );
 
   if (!user) {
     return res.redirect('/login?error=1');
@@ -567,7 +725,7 @@ app.get('/', requireAuth, (req, res) => {
       padding: 22px;
       box-shadow: 0 10px 28px rgba(0,0,0,0.08);
     }
-    h1, h2, h3 {
+    h1, h2 {
       margin-top: 0;
     }
     h1 {
@@ -578,10 +736,6 @@ app.get('/', requireAuth, (req, res) => {
       font-size: 22px;
       margin-bottom: 14px;
     }
-    h3 {
-      font-size: 18px;
-      margin-bottom: 10px;
-    }
     .grid {
       display: grid;
       gap: 14px;
@@ -590,7 +744,7 @@ app.get('/', requireAuth, (req, res) => {
       font-weight: 700;
       font-size: 14px;
     }
-    input, button {
+    input, button, select {
       width: 100%;
       box-sizing: border-box;
       padding: 12px 14px;
@@ -666,13 +820,14 @@ app.get('/', requireAuth, (req, res) => {
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 980px;
+      min-width: 1120px;
     }
     th, td {
       padding: 12px 10px;
       border-bottom: 1px solid #edf2f7;
       text-align: left;
       font-size: 14px;
+      vertical-align: middle;
     }
     th {
       background: #f8fafc;
@@ -731,9 +886,6 @@ app.get('/', requireAuth, (req, res) => {
       font-weight: 700;
       margin: 6px 0 10px;
     }
-    .config-box button {
-      margin-top: 6px;
-    }
     .close-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -754,6 +906,12 @@ app.get('/', requireAuth, (req, res) => {
       font-size: 22px;
       font-weight: 700;
     }
+    .small-btn {
+      width: auto;
+      padding: 8px 10px;
+      font-size: 13px;
+      border-radius: 8px;
+    }
     @media (max-width: 1180px) {
       .layout {
         grid-template-columns: 1fr;
@@ -764,7 +922,7 @@ app.get('/', requireAuth, (req, res) => {
         grid-template-columns: 1fr;
       }
       table {
-        min-width: 860px;
+        min-width: 980px;
       }
     }
   </style>
@@ -780,7 +938,14 @@ app.get('/', requireAuth, (req, res) => {
               <h1>POS HNL en pantalla, cobro real en USD</h1>
               <div class="small">Usuario actual: <strong>${currentUser.username}</strong> (${currentUser.role})</div>
             </div>
-            <button id="logoutBtn">Salir</button>
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+              ${
+                currentUser.role === 'admin'
+                  ? '<button id="createUserBtn">Crear usuario</button>'
+                  : ''
+              }
+              <button id="logoutBtn">Salir</button>
+            </div>
           </div>
           <p class="small">Calcula subtotal, ISV, total, muestra HNL en el reader y guarda todos los intentos de cobro.</p>
 
@@ -865,7 +1030,7 @@ app.get('/', requireAuth, (req, res) => {
           <div class="toolbar">
             <div>
               <h2 style="margin-bottom:4px;">Historial de ventas</h2>
-              <div class="small">Se guardan todos los intentos en sales_history.json y también se ven aquí.</div>
+              <div class="small">Se guardan todos los intentos en sales_history.json y los cierres en cash_closures.json.</div>
             </div>
             <button id="refreshSalesBtn">Actualizar tabla</button>
           </div>
@@ -903,6 +1068,7 @@ app.get('/', requireAuth, (req, res) => {
       usd_per_hnl: Number(initialConfig.usd_per_hnl || 0.04065),
       tax_rate: Number(initialConfig.tax_rate || 0.15),
     };
+
     const statusEl = document.getElementById('status');
     const descriptionEl = document.getElementById('description');
     const hnlAmountEl = document.getElementById('hnlAmount');
@@ -932,6 +1098,7 @@ app.get('/', requireAuth, (req, res) => {
       const subtotal = Number(hnlAmountEl.value) || 0;
       const tax = roundToCents(subtotal * currentConfig.tax_rate);
       const total = roundToCents(subtotal + tax);
+
       subtotalPreviewEl.textContent = 'L ' + subtotal.toFixed(2);
       taxPreviewEl.textContent = 'L ' + tax.toFixed(2);
       totalPreviewEl.textContent = 'L ' + total.toFixed(2);
@@ -961,19 +1128,24 @@ app.get('/', requireAuth, (req, res) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body || {}),
       });
+
       const data = await res.json();
+
       if (!res.ok) {
         throw new Error(data.error || 'Request failed');
       }
+
       return data;
     }
 
     async function getJson(url) {
       const res = await fetch(url);
       const data = await res.json();
+
       if (!res.ok) {
         throw new Error(data.error || 'Request failed');
       }
+
       return data;
     }
 
@@ -1036,15 +1208,106 @@ app.get('/', requireAuth, (req, res) => {
           '<div class="sep"></div>' +
           '<div class="row"><span>Cobrado en USD</span><span>$ ' + escapeHtml(sale.chargedUsd || '0.00') + '</span></div>' +
           (sale.errorMessage ? '<div class="mt">Error: ' + escapeHtml(sale.errorMessage) + '</div>' : '') +
+          (sale.manuallyAdjusted ? '<div class="mt">Ajustado manualmente por: ' + escapeHtml(sale.manuallyAdjustedBy || '') + '</div>' : '') +
           '<div class="sep"></div>' +
           '<div class="center">¡Gracias por su preferencia!</div>' +
           '<div class="center">Copia cliente</div>' +
           '<script>window.onload = function () { window.print(); };<\\/script>' +
         '</body>' +
         '</html>';
+
       printWindow.document.open();
       printWindow.document.write(html);
       printWindow.document.close();
+    }
+
+    async function updateSaleStatus(sale) {
+      if (currentUser.role !== 'admin') {
+        alert('Solo admin puede cambiar estados.');
+        return;
+      }
+
+      const pin = window.prompt('Ingrese PIN para cambiar el estado');
+      if (pin === null) return;
+      if (pin !== '5858') {
+        alert('PIN incorrecto.');
+        return;
+      }
+
+      const current = String(sale.paymentIntentStatus || 'failed');
+      const newStatus = window.prompt(
+        'Nuevo estado\\nOpciones: succeeded, failed, requires_payment_method, processing, canceled',
+        current
+      );
+
+      if (newStatus === null) return;
+
+      const trimmedStatus = String(newStatus || '').trim();
+      if (!trimmedStatus) {
+        alert('Estado inválido.');
+        return;
+      }
+
+      const errorMessage = window.prompt(
+        'Mensaje de error (déjalo vacío si ya quedó bien)',
+        sale.errorMessage || ''
+      );
+
+      const result = await post('/api/update-sale-status', {
+        receiptNumber: sale.receiptNumber,
+        newStatus: trimmedStatus,
+        errorMessage: errorMessage === null ? (sale.errorMessage || '') : errorMessage,
+      });
+
+      setStatus(result);
+      await loadSalesTable();
+      await loadShiftSummary();
+    }
+
+    async function createUser() {
+      if (currentUser.role !== 'admin') {
+        alert('Solo admin puede crear usuarios.');
+        return;
+      }
+
+      const pin = window.prompt('Ingrese PIN admin para crear usuario');
+      if (pin === null) return;
+      if (pin !== '5858') {
+        alert('PIN incorrecto.');
+        return;
+      }
+
+      const username = window.prompt('Nuevo usuario');
+      if (username === null) return;
+
+      const trimmedUsername = String(username || '').trim();
+      if (!trimmedUsername) {
+        alert('Usuario inválido.');
+        return;
+      }
+
+      const password = window.prompt('Clave del nuevo usuario');
+      if (password === null) return;
+
+      const trimmedPassword = String(password || '').trim();
+      if (!trimmedPassword) {
+        alert('Clave inválida.');
+        return;
+      }
+
+      const roleInput = window.prompt('Rol del usuario: admin o cashier', 'cashier');
+      if (roleInput === null) return;
+
+      const trimmedRole = String(roleInput || '').trim().toLowerCase();
+      const role = trimmedRole === 'admin' ? 'admin' : 'cashier';
+
+      const result = await post('/api/create-user', {
+        username: trimmedUsername,
+        password: trimmedPassword,
+        role: role,
+      });
+
+      setStatus(result);
     }
 
     function renderSalesTable(sales) {
@@ -1066,7 +1329,12 @@ app.get('/', requireAuth, (req, res) => {
             '<td class="right">$ ' + escapeHtml(sale.chargedUsd || '0.00') + '</td>' +
             '<td><span class="' + getStatusClass(sale.paymentIntentStatus) + '">' + escapeHtml(sale.paymentIntentStatus || 'failed') + '</span></td>' +
             '<td>' + escapeHtml(sale.errorMessage || '') + '</td>' +
-            '<td><button type="button" data-sale="' + saleJson + '" class="print-sale-btn">Imprimir</button></td>' +
+            '<td>' +
+              '<button type="button" data-sale="' + saleJson + '" class="print-sale-btn small-btn">Imprimir</button>' +
+              (currentUser.role === 'admin'
+                ? ' <button type="button" data-sale="' + saleJson + '" class="edit-sale-btn small-btn">Cambiar estado</button>'
+                : '') +
+            '</td>' +
           '</tr>'
         );
       }).join('');
@@ -1075,6 +1343,17 @@ app.get('/', requireAuth, (req, res) => {
         btn.addEventListener('click', function () {
           const sale = JSON.parse(decodeURIComponent(btn.getAttribute('data-sale')));
           printReceipt(sale);
+        });
+      });
+
+      document.querySelectorAll('.edit-sale-btn').forEach(function (btn) {
+        btn.addEventListener('click', async function () {
+          try {
+            const sale = JSON.parse(decodeURIComponent(btn.getAttribute('data-sale')));
+            await updateSaleStatus(sale);
+          } catch (err) {
+            setStatus('Error cambiando estado: ' + err.message);
+          }
         });
       });
     }
@@ -1138,24 +1417,37 @@ app.get('/', requireAuth, (req, res) => {
       }
 
       if (type === 'rate') {
-        const newValue = window.prompt('Nueva tasa USD por HNL', String(currentConfig.usd_per_hnl.toFixed(4)));
+        const newValue = window.prompt(
+          'Nueva tasa USD por HNL',
+          String(currentConfig.usd_per_hnl.toFixed(4))
+        );
         if (newValue === null) return;
-        const rate = Number(newValue);
+
+        const rate = Number(String(newValue).trim());
+
         if (!Number.isFinite(rate) || rate <= 0) {
           alert('Tasa inválida.');
           return;
         }
+
         await post('/api/change-rate', { rate: rate });
       }
 
       if (type === 'tax') {
-        const newValue = window.prompt('Nuevo impuesto (%)', String((currentConfig.tax_rate * 100).toFixed(2)));
+        const newValue = window.prompt(
+          'Nuevo impuesto (%)',
+          String((currentConfig.tax_rate * 100).toFixed(2))
+        );
         if (newValue === null) return;
-        const taxPct = Number(newValue);
-        if (!Number.isFinite(taxPct) || taxPct < 0) {
+
+        const trimmed = String(newValue).trim();
+        const taxPct = Number(trimmed);
+
+        if (trimmed === '' || !Number.isFinite(taxPct) || taxPct < 0) {
           alert('Impuesto inválido.');
           return;
         }
+
         await post('/api/change-tax', { taxRatePct: taxPct });
       }
 
@@ -1165,17 +1457,32 @@ app.get('/', requireAuth, (req, res) => {
     }
 
     hnlAmountEl.addEventListener('input', updateSummary);
+
     document.getElementById('refreshSalesBtn').addEventListener('click', async function () {
       await loadSalesTable();
       await loadShiftSummary();
     });
+
     document.getElementById('printBtn').addEventListener('click', function () {
       printReceipt(lastSale);
     });
+
     document.getElementById('logoutBtn').addEventListener('click', async function () {
       await post('/logout');
       window.location.href = '/login';
     });
+
+    const createUserBtn = document.getElementById('createUserBtn');
+    if (createUserBtn) {
+      createUserBtn.addEventListener('click', async function () {
+        try {
+          await createUser();
+        } catch (err) {
+          setStatus('Error creando usuario: ' + err.message);
+        }
+      });
+    }
+
     document.getElementById('changeRateBtn').addEventListener('click', async function () {
       try {
         await changeConfigValue('rate');
@@ -1183,6 +1490,7 @@ app.get('/', requireAuth, (req, res) => {
         setStatus('Error cambiando tasa: ' + err.message);
       }
     });
+
     document.getElementById('changeTaxBtn').addEventListener('click', async function () {
       try {
         await changeConfigValue('tax');
@@ -1190,6 +1498,7 @@ app.get('/', requireAuth, (req, res) => {
         setStatus('Error cambiando impuesto: ' + err.message);
       }
     });
+
     document.getElementById('closeShiftBtn').addEventListener('click', async function () {
       try {
         const summary = await post('/api/close-shift', {});
@@ -1267,9 +1576,18 @@ app.get('/api/sales', requireAuth, (_req, res) => {
   }
 });
 
+app.get('/api/closures', requireAuth, requireAdmin, (_req, res) => {
+  try {
+    return res.json(getCashClosuresData());
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/shift-summary', requireAuth, (_req, res) => {
   try {
-    return res.json({ summary: calculateShiftSummary() });
+    const summary = calculateShiftSummary();
+    return res.json({ ok: true, summary });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -1278,12 +1596,15 @@ app.get('/api/shift-summary', requireAuth, (_req, res) => {
 app.post('/api/change-rate', requireAuth, requireAdmin, (req, res) => {
   try {
     const rate = Number(req.body.rate);
+
     if (!Number.isFinite(rate) || rate <= 0) {
       return res.status(400).json({ error: 'Invalid rate' });
     }
+
     const config = getConfig();
     config.usd_per_hnl = rate;
     saveConfig(config);
+
     return res.json({ ok: true, config });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -1293,25 +1614,128 @@ app.post('/api/change-rate', requireAuth, requireAdmin, (req, res) => {
 app.post('/api/change-tax', requireAuth, requireAdmin, (req, res) => {
   try {
     const taxRatePct = Number(req.body.taxRatePct);
+
     if (!Number.isFinite(taxRatePct) || taxRatePct < 0) {
       return res.status(400).json({ error: 'Invalid tax' });
     }
+
     const config = getConfig();
     config.tax_rate = taxRatePct / 100;
     saveConfig(config);
+
     return res.json({ ok: true, config });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/close-shift', requireAuth, requireAdmin, (_req, res) => {
+app.post('/api/create-user', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const username = String(req.body.username || '').trim();
+    const password = String(req.body.password || '').trim();
+    const roleRaw = String(req.body.role || '').trim().toLowerCase();
+    const role = roleRaw === 'admin' ? 'admin' : 'cashier';
+
+    if (!username) {
+      return res.status(400).json({ error: 'Username required' });
+    }
+
+    if (!password) {
+      return res.status(400).json({ error: 'Password required' });
+    }
+
+    const usersData = getUsersData();
+    const exists = (usersData.users || []).some(
+      (user) => String(user.username).toLowerCase() === username.toLowerCase()
+    );
+
+    if (exists) {
+      return res.status(400).json({ error: 'Ese usuario ya existe' });
+    }
+
+    usersData.users.push({
+      username,
+      password,
+      role,
+      createdAtISO: new Date().toISOString(),
+    });
+
+    saveUsersData(usersData);
+
+    return res.json({
+      ok: true,
+      message: 'Usuario creado correctamente.',
+      user: { username, role },
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/update-sale-status', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const receiptNumber = String(req.body.receiptNumber || '').trim();
+    const newStatus = String(req.body.newStatus || '').trim();
+    const errorMessage = String(req.body.errorMessage || '');
+
+    if (!receiptNumber) {
+      return res.status(400).json({ error: 'Missing receipt number' });
+    }
+
+    if (!newStatus) {
+      return res.status(400).json({ error: 'Missing new status' });
+    }
+
+    const updatedSale = updateSaleStatusByReceiptNumber({
+      receiptNumber,
+      newStatus,
+      errorMessage,
+      changedBy: req.currentUser.username,
+    });
+
+    return res.json({
+      ok: true,
+      message: 'Estado actualizado correctamente.',
+      sale: updatedSale,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/close-shift', requireAuth, requireAdmin, (req, res) => {
   try {
     const summary = calculateShiftSummary();
+    const currentUser = req.currentUser || { username: 'admin' };
+
+    const closureRecord = {
+      closedAtISO: new Date().toISOString(),
+      closedAtLocal: new Date().toLocaleString('es-HN'),
+      closedBy: currentUser.username,
+      shiftStartISO: summary.shiftStartISO,
+      shiftStartLocal: summary.shiftStartLocal,
+      attempts: summary.attempts,
+      successCount: summary.successCount,
+      failedCount: summary.failedCount,
+      totalSoldHnl: Number(summary.totalSoldHnl).toFixed(2),
+      totalFailedHnl: Number(summary.totalFailedHnl).toFixed(2),
+      totalUsd: Number(summary.totalUsd).toFixed(2),
+      totalTaxHnl: Number(summary.totalTaxHnl).toFixed(2),
+    };
+
+    saveCashClosureRecord(closureRecord);
+
     const config = getConfig();
     config.current_shift_start = new Date().toISOString();
     saveConfig(config);
-    return res.json({ ok: true, summary });
+
+    return res.json({
+      ok: true,
+      message: 'Caja cerrada correctamente.',
+      summary,
+      closure_record: closureRecord,
+      new_shift_start: config.current_shift_start,
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -1327,6 +1751,7 @@ app.post('/api/preview', requireAuth, async (req, res) => {
     if (!description) {
       return res.status(400).json({ error: 'Description is required.' });
     }
+
     if (!Number.isFinite(hnlAmount) || hnlAmount <= 0) {
       return res.status(400).json({ error: 'HNL amount must be greater than 0.' });
     }
@@ -1368,6 +1793,7 @@ app.post('/api/charge', requireAuth, async (req, res) => {
   if (!description) {
     return res.status(400).json({ error: 'Description is required.' });
   }
+
   if (!Number.isFinite(hnlAmount) || hnlAmount <= 0) {
     return res.status(400).json({ error: 'HNL amount must be greater than 0.' });
   }
@@ -1405,6 +1831,7 @@ app.post('/api/charge', requireAuth, async (req, res) => {
   } catch (err) {
     flowError = err;
     errorMessage = err.message || 'Payment flow error';
+
     if (paymentIntent && paymentIntent.id) {
       try {
         finalPaymentIntent = await getFinalPaymentIntentWithRetry(paymentIntent.id);
@@ -1433,19 +1860,24 @@ app.post('/api/charge', requireAuth, async (req, res) => {
     conversionRateUsdPerHnl: Number(config.usd_per_hnl).toFixed(4),
     paymentIntentId: paymentIntent ? paymentIntent.id : '',
     paymentIntentStatus: finalStatus,
-    rawStripeStatus: finalPaymentIntent && finalPaymentIntent.status ? finalPaymentIntent.status : '',
+    rawStripeStatus:
+      finalPaymentIntent && finalPaymentIntent.status ? finalPaymentIntent.status : '',
     amountReceivedUsd:
       finalPaymentIntent && typeof finalPaymentIntent.amount_received === 'number'
         ? (finalPaymentIntent.amount_received / 100).toFixed(2)
         : '0.00',
     errorMessage,
+    manuallyAdjusted: false,
   };
 
   saveSaleRecord(saleRecord);
 
   return res.json({
     ok: finalStatus === 'succeeded',
-    message: finalStatus === 'succeeded' ? 'Payment flow completed on WisePOS E.' : 'Payment attempt saved.',
+    message:
+      finalStatus === 'succeeded'
+        ? 'Payment flow completed on WisePOS E.'
+        : 'Payment attempt saved.',
     receipt_number: receiptNumber,
     created_at: saleRecord.localDateTime,
     displayed_to_customer: {

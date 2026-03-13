@@ -53,10 +53,14 @@
       "chargedUsd": "1.17",
       "conversionRateUsdPerHnl": "0.0406",
       "paymentIntentId": "pi_3TABX5AVm4DJPon91tRAJv6U",
-      "paymentIntentStatus": "requires_payment_method",
+      "paymentIntentStatus": "succeeded",
       "rawStripeStatus": "requires_payment_method",
       "amountReceivedUsd": "0.00",
-      "errorMessage": ""
+      "errorMessage": "",
+      "manuallyAdjusted": true,
+      "manuallyAdjustedAtISO": "2026-03-12T21:06:30.776Z",
+      "manuallyAdjustedAtLocal": "12/3/2026, 3:06:30 p. m.",
+      "manuallyAdjustedBy": "admin"
     },
     {
       "receiptNumber": "000002",
@@ -71,10 +75,14 @@
       "chargedCurrency": "usd",
       "chargedUsd": "1.17",
       "paymentIntentId": "pi_3TAB6cAVm4DJPon9203Wgyil",
-      "paymentIntentStatus": "requires_payment_method",
+      "paymentIntentStatus": "succeeded",
       "errorMessage": "",
       "usedRate": "0.0406",
-      "usedTaxRate": "0.15"
+      "usedTaxRate": "0.15",
+      "manuallyAdjusted": true,
+      "manuallyAdjustedAtISO": "2026-03-12T21:09:34.789Z",
+      "manuallyAdjustedAtLocal": "12/3/2026, 3:09:34 p. m.",
+      "manuallyAdjustedBy": "admin"
     },
     {
       "receiptNumber": "000001",

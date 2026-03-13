@@ -1,5 +1,6 @@
 {
   "usd_per_hnl": 0.03755,
-  "tax_rate": 0.15,
-  "receipt_counter": 6
+  "tax_rate": 1e-10,
+  "receipt_counter": 6,
+  "current_shift_start": "2026-03-12T20:45:38.477Z"
 }
